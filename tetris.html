@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TETRIS — SRS Rebuild</title>
+<!--
+============================================================================
+REVERSE-ENGINEERING-DOKUMENTATION (REA) — Ziel: TETRIS (Guideline / SRS)
+Rekonstruktion aller Kern-Mechaniken als Browser-Rebuild (eine HTML-Datei).
+
+1. ROTATIONSSYSTEM (Super Rotation System, SRS)
+   - 4 Rotation States pro Piece: 0, R, 2, L
+   - 5 Kicks pro Rotations-Transition (Wall-Kick-Tabellen)
+   - Getrennte Tabellen für J/L/S/T/Z und I-Piece (O kickt nie)
+   - SRS-Koordinaten: y positiv nach OBEN -> in Grid-Koordinaten invertiert
+
+2. RANDOMIZER
+   - 7-Bag: exakt 7 Pieces pro Beutel, gemischt, Beutel aneinander
+   - Damit max. 14 Pieces ohne Duplikat ("14-Bad" ist die Obergrenze)
+
+3. GRAVITATION (Guideline-Tabelle, in Frames @ 60fps)
+   Level 1..20: 48,43,38,33,28,23,18,11,9,8,6,5,5,4,4,3,3,3,2,2
+   Level 20+: 2 Frames (33 ms) — praktisch Instant-Drop
+
+4. SCORING (Guideline)
+   - 1/2/3/4 Linien: 100 / 300 / 500 / 800 × Level
+   - T-Spin: 800 / 1200 / 1600 × Level  |  Mini-T-Spin: 100 / 200 / 400 × Level
+   - Back-to-Back (B2B): ×1.5 auf 4-Liner und volle T-Spins
+     (Mini-T-Spins brechen die B2B-Kette nicht)
+   - Soft Drop: 1 Punkt pro Zelle | Hard Drop: 2 Punkte pro Zelle
+
+5. T-SPIN-DETEKTION (3-Corner-Regel)
+   - Letztes erfolgreiches Move muss eine Rotation gewesen sein
+   - >= 3 der 4 Diagonal-Ecken um die T-Mitte gefüllt (Block/Wand) -> T-Spin
+   - Genau 2 Ecken gefüllt UND beide "Facing"-Ecken (Richtung der T-Spitze)
+     leer -> Mini-T-Spin
+   - Facing-Ecken pro Rotation: 0:[TL,TR]  R:[TR,BR]  2:[BL,BR]  L:[TL,BL]
+
+6. LOCK DELAY: 500 ms, max. 15 Move-Resets (danach sofortiger Lock)
+7. DAS / ARR: 170 ms / 50 ms (Guideline-Default)
+8. SONSTIGES
+   - HOLD: 1x pro Piece (kein Double-Hold)
+   - NEXT: 5 Pieces | Spawn: verborgene Zeilen 21-22, Spalte 4-5
+   - Game Over: Spawn blockiert ODER Piece komplett oberhalb der
+     sichtbaren Fläche gelockt ("Lock Out")
+============================================================================
+-->
+<style>
+  :root {
+    --bg: #070a14;
+    --panel: rgba(255,255,255,0.045);
+    --border: rgba(255,255,255,0.09);
+    --accent: #4cc9f0;
+    --text: #e6ebf4;
+    --dim: #8b93a7;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    background: radial-gradient(1200px 700px at 50% -10%, #12203f 0%, var(--bg) 55%);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: var(--text);
+    min-height:100vh;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; padding:18px;
+    -webkit-user-select:none; user-select:none;
+  }
+  h1 {
+    font-size:30px; font-weight:900; letter-spacing:10px;
+    background: linear-gradient(90deg,#4cc9f0,#c77dff,#ff9f1c);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    text-transform:uppercase;
+  }
+  .game { display:flex; gap:16px; align-items:flex-start; }
+  .panel {
+    background: var(--panel);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:14px;
+  }
+  .side { display:flex; flex-direction:column; gap:14px; width:150px; }
+  .panel h3 {
+    font-size:11px; letter-spacing:2px; text-transform:uppercase;
+    color:var(--dim); margin-bottom:8px;
+  }
+  .board-wrap { position:relative; line-height:0; }
+  canvas { display:block; }
+  #board {
+    background:#04060c;
+    border:1px solid var(--border);
+    border-radius:10px;
+    box-shadow: 0 0 40px rgba(76,201,240,0.12), inset 0 0 30px rgba(0,0,0,0.6);
+  }
+  .stat { margin-bottom:10px; }
+  .stat .label { font-size:10px; letter-spacing:2px; text-transform:uppercase; color:var(--dim); }
+  .stat .value { font-size:22px; font-weight:800; font-variant-numeric: tabular-nums; }
+  #b2b {
+    display:inline-block; margin-top:2px; padding:2px 8px; border-radius:20px;
+    font-size:11px; font-weight:700; letter-spacing:1px;
+    background:rgba(199,125,255,0.18); color:#c77dff;
+    border:1px solid rgba(199,125,255,0.4);
+  }
+  .overlay {
+    position:absolute; inset:0; z-index:5;
+    background:rgba(4,6,12,0.88);
+    border-radius:10px;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px; text-align:center;
+  }
+  .overlay h2 { font-size:34px; font-weight:900; letter-spacing:4px; }
+  .overlay p { color:var(--dim); font-size:14px; }
+  .overlay .final { font-size:20px; font-weight:800; color:var(--accent); }
+  button {
+    margin-top:6px; padding:10px 26px; border:none; border-radius:10px;
+    background:linear-gradient(90deg,#4cc9f0,#3a86ff);
+    color:#04121f; font-weight:800; font-size:15px; letter-spacing:1px;
+    cursor:pointer;
+  }
+  button:hover { filter:brightness(1.15); }
+  .hidden { display:none !important; }
+  #popup {
+    position:absolute; top:38%; left:0; right:0; z-index:4;
+    text-align:center; font-size:30px; font-weight:900; letter-spacing:2px;
+    color:#fff; text-shadow:0 0 16px var(--accent);
+    opacity:0; pointer-events:none;
+  }
+  #popup.show { animation: pop 1s ease-out; }
+  @keyframes pop {
+    0% { opacity:0; transform:scale(0.5); }
+    18% { opacity:1; transform:scale(1.18); }
+    55% { opacity:1; transform:scale(1); }
+    100% { opacity:0; transform:scale(1); }
+  }
+  .keys { font-size:11px; color:var(--dim); line-height:1.9; }
+  .keys b { color:var(--text); font-weight:700; }
+  .touch { display:none; flex-wrap:wrap; gap:8px; justify-content:center; max-width:520px; }
+  .touch button {
+    margin:0; padding:12px 0; flex:1 1 30%; min-width:64px;
+    background:var(--panel); color:var(--text);
+    border:1px solid var(--border); font-size:17px;
+  }
+  @media (max-width: 640px) {
+    .side { display:none; }
+    .touch { display:flex; }
+    h1 { font-size:22px; letter-spacing:6px; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Tetris</h1>
+
+<div class="game">
+  <!-- LINKE SEITE: HOLD + STATS -->
+  <div class="side">
+    <div class="panel">
+      <h3>Hold <span style="float:right">[C]</span></h3>
+      <canvas id="hold" width="120" height="120"></canvas>
+    </div>
+    <div class="panel">
+      <div class="stat"><div class="label">Score</div><div class="value" id="score">0</div></div>
+      <div class="stat"><div class="label">Highscore</div><div class="value" id="highscore">0</div></div>
+      <div class="stat"><div class="label">Level</div><div class="value" id="level">1</div></div>
+      <div class="stat"><div class="label">Linien</div><div class="value" id="lines">0</div></div>
+      <div id="b2b" class="hidden">B2B ×1.5</div>
+    </div>
+  </div>
+
+  <!-- MITTE: SPIELFELD -->
+  <div class="board-wrap">
+    <canvas id="board" width="320" height="640"></canvas>
+    <div id="popup"></div>
+    <div id="pauseOverlay" class="overlay hidden">
+      <h2>PAUSE</h2>
+      <p>P / Esc zum Fortsetzen</p>
+    </div>
+    <div id="overOverlay" class="overlay hidden">
+      <h2>GAME OVER</h2>
+      <p>Score</p>
+      <div class="final" id="finalScore">0</div>
+      <button id="restartBtn">Neustart</button>
+      <p>…oder Taste [R]</p>
+    </div>
+  </div>
+
+  <!-- RECHTE SEITE: NEXT + STEUERUNG -->
+  <div class="side">
+    <div class="panel">
+      <h3>Nächste</h3>
+      <canvas id="next" width="120" height="600"></canvas>
+    </div>
+    <div class="panel">
+      <h3>Steuerung</h3>
+      <div class="keys">
+        <b>← →</b> Bewegen<br>
+        <b>↓</b> Soft Drop<br>
+        <b>↑ / X</b> Drehen ↷<br>
+        <b>Z</b> Drehen ↶<br>
+        <b>Leertaste</b> Hard Drop<br>
+        <b>C / Shift</b> Hold<br>
+        <b>P / Esc</b> Pause<br>
+        <b>R</b> Neustart<br>
+        <b>M</b> Ton an/aus
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TOUCH-CONTROLS (Mobil) -->
+<div class="touch">
+  <button id="tLeft">◀</button>
+  <button id="tRight">▶</button>
+  <button id="tDown">▼</button>
+  <button id="tRot">⟳</button>
+  <button id="tDrop">⤓</button>
+  <button id="tHold">H</button>
+  <button id="tPause">⏸</button>
+</div>
+
+<script>
+'use strict';
+
+/* ================= KONSTANTEN ================= */
+const COLS = 10, VISIBLE_ROWS = 20, HIDDEN_ROWS = 2, ROWS = VISIBLE_ROWS + HIDDEN_ROWS;
+const CELL = 32;
+const DAS = 170, ARR = 50, SOFT_DROP_MS = 50, LOCK_DELAY = 500, MAX_LOCK_RESETS = 15;
+const NEXT_COUNT = 5;
+const HIGHSCORE_KEY = 'tetris_rebuild_highscore';
+
+// Guideline-Gravity in Frames @ 60fps (Level 1..20), Level 20+ => 2 Frames
+const GRAVITY_TABLE = [48,43,38,33,28,23,18,11,9,8,6,5,5,4,4,3,3,3,2,2];
+
+const COLORS = {
+  I:'#00e5ff', O:'#ffd60a', T:'#c77dff', S:'#06d6a0',
+  Z:'#ef476f', J:'#3a86ff', L:'#ff9f1c'
+};
+
+/* SRS-Formen: [Rotation][Zelle] = [x, y] innerhalb 3x3 / I & O 4x4 */
+const SHAPES = {
+  I: [
+    [[0,1],[1,1],[2,1],[3,1]],
+    [[2,0],[2,1],[2,2],[2,3]],
+    [[0,2],[1,2],[2,2],[3,2]],
+    [[1,0],[1,1],[1,2],[1,3]]
+  ],
+  O: [
+    [[0,0],[1,0],[0,1],[1,1]],
+    [[0,0],[1,0],[0,1],[1,1]],
+    [[0,0],[1,0],[0,1],[1,1]],
+    [[0,0],[1,0],[0,1],[1,1]]
+  ],
+  T: [
+    [[1,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[2,1],[1,2]],
+    [[1,0],[0,1],[1,1],[1,2]]
+  ],
+  S: [
+    [[1,0],[2,0],[0,1],[1,1]],
+    [[1,0],[1,1],[2,1],[2,2]],
+    [[1,1],[2,1],[0,2],[1,2]],
+    [[0,0],[0,1],[1,1],[1,2]]
+  ],
+  Z: [
+    [[0,0],[1,0],[1,1],[2,1]],
+    [[2,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[1,2],[2,2]],
+    [[1,0],[0,1],[1,1],[0,2]]
+  ],
+  J: [
+    [[0,0],[0,1],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[1,2]],
+    [[0,1],[1,1],[2,1],[2,2]],
+    [[1,0],[1,1],[0,2],[1,2]]
+  ],
+  L: [
+    [[2,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[1,2],[2,2]],
+    [[0,1],[1,1],[2,1],[0,2]],
+    [[0,0],[1,0],[1,1],[0,2]]
+  ]
+};
+
+/* SRS-Wall-Kicks: [dx, dyUp] (SRS-Koordinaten, y nach oben).
+   Anwendung im Grid: ny = piece.y - dyUp */
+const KICKS = {
+  JLSTZ: {
+    '0>1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+    '1>0': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+    '1>2': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+    '2>1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+    '2>3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]],
+    '3>2': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+    '3>0': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+    '0>3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]]
+  },
+  I: {
+    '0>1': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+    '1>0': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+    '1>2': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]],
+    '2>1': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+    '2>3': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+    '3>2': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+    '3>0': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+    '0>3': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]]
+  }
+};
+
+/* Facing-Ecken pro Rotation (Index: 0=TL, 1=TR, 2=BL, 3=BR) */
+const FACING_CORNERS = [[0,1],[1,3],[2,3],[0,2]];
+
+/* ================= STATE ================= */
+let board, piece, queue, holdPiece, canHold;
+let score, lines, level, b2b, gameOver, paused, muted = false;
+let gravityTimer, lockTimer, lockResets, lastActionRotation;
+let softDropHeld, dasDir, dasTimer, arrTimer;
+let clearing, clearTimer;
+let highscore = 0;
+const keys = new Set();
+
+/* ================= CANVASES ================= */
+const boardCv = document.getElementById('board');
+const ctx = boardCv.getContext('2d');
+const holdCv = document.getElementById('hold');
+const holdCtx = holdCv.getContext('2d');
+const nextCv = document.getElementById('next');
+const nextCtx = nextCv.getContext('2d');
+const W = boardCv.width, H = boardCv.height;
+
+/* ================= AUDIO (WebAudio, keine Dateien) ================= */
+let audioCtx = null;
+function beep(freq, dur, type = 'square', vol = 0.05) {
+  if (muted) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch (e) { /* Audio blockiert -> ignorieren */ }
+}
+
+/* ================= 7-BAG RANDOMIZER ================= */
+function refillBag() {
+  const bag = ['I','O','T','S','Z','J','L'];
+  for (let i = bag.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+  queue.push(...bag);
+}
+function keepQueueFull() { while (queue.length < NEXT_COUNT + 1) refillBag(); }
+
+/* ================= SPIELLOGIK ================= */
+function gravityTime() {
+  const frames = GRAVITY_TABLE[Math.min(level - 1, GRAVITY_TABLE.length - 1)];
+  return (frames / 60) * 1000;
+}
+
+function fits(type, rot, x, y) {
+  for (const [cx, cy] of SHAPES[type][rot]) {
+    const nx = x + cx, ny = y + cy;
+    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return false;
+    if (board[ny][nx]) return false;
+  }
+  return true;
+}
+
+function onGround() {
+  return !fits(piece.type, piece.rotation, piece.x, piece.y + 1);
+}
+
+function tryMove(dx, dy, isManual) {
+  if (!piece || gameOver || paused || clearing) return false;
+  const nx = piece.x + dx, ny = piece.y + dy;
+  if (!fits(piece.type, piece.rotation, nx, ny)) return false;
+  piece.x = nx; piece.y = ny;
+  if (isManual) lastActionRotation = false;
+  // Lock-Delay-Reset bei manueller Bewegung am Boden (max. 15x)
+  if (isManual && lockResets < MAX_LOCK_RESETS && onGround()) {
+    lockTimer = 0; lockResets++;
+  }
+  return true;
+}
+
+function rotate(dir) {
+  if (!piece || gameOver || paused || clearing) return;
+  const from = piece.rotation;
+  const to = (from + dir + 4) % 4;
+  const table = KICKS[piece.type === 'I' ? 'I' : 'JLSTZ'][from + '>' + to];
+  for (const [dx, dyUp] of table) {
+    const nx = piece.x + dx, ny = piece.y - dyUp; // SRS y-up -> Grid y-down
+    if (fits(piece.type, to, nx, ny)) {
+      piece.x = nx; piece.y = ny; piece.rotation = to;
+      lastActionRotation = true;
+      if (lockResets < MAX_LOCK_RESETS && onGround()) { lockTimer = 0; lockResets++; }
+      beep(340, 0.04);
+      return;
+    }
+  }
+  lastActionRotation = false; // fehlgeschlagene Rotation
+}
+
+function hardDrop() {
+  if (!piece || gameOver || paused || clearing) return;
+  let d = 0;
+  while (fits(piece.type, piece.rotation, piece.x, piece.y + 1)) { piece.y++; d++; }
+  score += d * 2; // Guideline: 2 Punkte pro Zelle
+  beep(120, 0.08, 'triangle', 0.09);
+  lockPiece();
+}
+
+function ghostY() {
+  let gy = piece.y;
+  while (fits(piece.type, piece.rotation, piece.x, gy + 1)) gy++;
+  return gy;
+}
+
+function doHold() {
+  if (!piece || !canHold || gameOver || paused || clearing) return;
+  const t = piece.type;
+  if (holdPiece) {
+    const h = holdPiece;
+    holdPiece = t;
+    piece = { type: h, rotation: 0, x: 3, y: 0 };
+    if (!fits(h, 0, 3, 0)) { endGame(); return; }
+  } else {
+    holdPiece = t;
+    spawnPiece();
+  }
+  canHold = false;
+  gravityTimer = 0; lockTimer = 0; lockResets = 0; lastActionRotation = false;
+  beep(240, 0.05, 'sine', 0.06);
+}
+
+function spawnPiece() {
+  const type = queue.shift();
+  keepQueueFull();
+  piece = { type, rotation: 0, x: 3, y: 0 }; // Spawn: verborgene Zeilen 21-22
+  gravityTimer = 0; lockTimer = 0; lockResets = 0; lastActionRotation = false;
+  if (!fits(type, 0, 3, 0)) endGame(); // Spawn blockiert -> Game Over
+}
+
+/* T-Spin-Erkennung: 3-Corner-Regel (0=none, 1=mini, 2=full) */
+function detectTSpin() {
+  if (piece.type !== 'T' || !lastActionRotation) return 0;
+  const x = piece.x, y = piece.y;
+  const corners = [[x,y],[x+2,y],[x,y+2],[x+2,y+2]];
+  const filled = corners.map(([px,py]) =>
+    px < 0 || px >= COLS || py >= ROWS || board[py][px] > 0);
+  const count = filled.filter(Boolean).length;
+  if (count >= 3) return 2;
+  if (count === 2) {
+    const f = FACING_CORNERS[piece.rotation];
+    if (!filled[f[0]] && !filled[f[1]]) return 1;
+  }
+  return 0;
+}
+
+function lockPiece() {
+  const spin = detectTSpin();
+  const placedCells = [];
+
+  // Piece einbrennen
+  for (const [cx, cy] of SHAPES[piece.type][piece.rotation]) {
+    const nx = piece.x + cx, ny = piece.y + cy;
+    if (ny < ROWS) { board[ny][nx] = piece.type; placedCells.push(ny); }
+  }
+
+  // Lock Out: Piece komplett in den verborgenen Zeilen
+  if (placedCells.every(r => r < HIDDEN_ROWS)) { endGame(); return; }
+
+  // Volle Zeilen sammeln
+  const full = [];
+  for (let r = 0; r < ROWS; r++) if (board[r].every(v => v)) full.push(r);
+
+  // Scoring (Guideline)
+  let gained = 0, isDifficult = false, text = '';
+  const n = full.length;
+  if (spin === 2) {
+    gained = [0, 800, 1200, 1600][n] * level;
+    isDifficult = true;
+    text = n === 4 ? 'T-SPIN TETRIS!' : 'T-SPIN!';
+  } else if (spin === 1) {
+    gained = [0, 100, 200, 400][n] * level;
+    text = n > 0 ? 'mini T-SPIN' : '';
+  } else {
+    gained = [0, 100, 300, 500, 800][n] * level;
+    isDifficult = (n === 4);
+    text = ['','','DOUBLE','TRIPLE','TETRIS!'][n];
+  }
+  if (isDifficult && b2b) gained = Math.floor(gained * 1.5);
+  b2b = isDifficult; // Mini-T-Spins brechen die Kette nicht
+  score += gained;
+
+  if (n > 0) {
+    // Kurz-Animation, Punkte werden sofort gewertet
+    clearing = { rows: full };
+    clearTimer = 320;
+    piece = null;
+    showPop(text);
+    if (n === 4) { beep(660,0.1); setTimeout(()=>beep(880,0.12),90); }
+    else if (spin === 2) { beep(990,0.12,'sine',0.07); }
+    else beep(520, 0.08);
+    return;
+  }
+  if (spin === 2) { showPop('T-SPIN!'); beep(990,0.12,'sine',0.07); }
+  beep(200, 0.05, 'triangle', 0.05);
+  piece = null;
+  canHold = true;
+  spawnPiece();
+}
+
+function finishClear() {
+  const rows = clearing.rows;
+  const remaining = board.filter((row, r) => !rows.includes(r));
+  while (remaining.length < ROWS) remaining.unshift(Array(COLS).fill(0));
+  board = remaining;
+  lines += rows.length;
+  level = 1 + Math.floor(lines / 10);
+  clearing = null;
+  canHold = true;
+  spawnPiece();
+}
+
+function endGame() {
+  gameOver = true;
+  piece = null;
+  if (score > highscore) {
+    highscore = score;
+    try { localStorage.setItem(HIGHSCORE_KEY, String(highscore)); } catch (e) {}
+  }
+  document.getElementById('finalScore').textContent = formatNum(score);
+  document.getElementById('overOverlay').classList.remove('hidden');
+  beep(150, 0.4, 'sawtooth', 0.06);
+}
+
+function togglePause() {
+  if (gameOver) return;
+  paused = !paused;
+  document.getElementById('pauseOverlay').classList.toggle('hidden', !paused);
+}
+
+function newGame() {
+  board = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+  queue = []; keepQueueFull();
+  holdPiece = null; canHold = true;
+  score = 0; lines = 0; level = 1; b2b = false;
+  gameOver = false; paused = false;
+  gravityTimer = 0; lockTimer = 0; lockResets = 0; lastActionRotation = false;
+  softDropHeld = false; dasDir = 0; dasTimer = 0; arrTimer = 0;
+  clearing = null; clearTimer = 0;
+  document.getElementById('pauseOverlay').classList.add('hidden');
+  document.getElementById('overOverlay').classList.add('hidden');
+  spawnPiece();
+}
+
+/* ================= UPDATE LOOP ================= */
+function update(dt) {
+  if (gameOver || paused) return;
+
+  if (clearing) {
+    clearTimer -= dt;
+    if (clearTimer <= 0) finishClear();
+    return;
+  }
+  if (!piece) return;
+
+  // DAS / ARR (autorisches horizontales Bewegen)
+  if (dasDir !== 0) {
+    dasTimer += dt;
+    if (dasTimer >= DAS) {
+      arrTimer += dt;
+      while (arrTimer >= ARR) {
+        if (!tryMove(dasDir, 0, true)) break;
+        arrTimer -= ARR;
+      }
+    }
+  }
+
+  // Gravitation (Soft Drop: 50 ms / Zelle)
+  const gTime = softDropHeld ? Math.min(gravityTime(), SOFT_DROP_MS) : gravityTime();
+  gravityTimer += dt;
+  let guard = 0;
+  while (gravityTimer >= gTime && guard++ < 40) {
+    gravityTimer -= gTime;
+    if (tryMove(0, 1, false)) { if (softDropHeld) score++; }
+    else break;
+  }
+
+  // Lock Delay
+  if (onGround()) {
+    lockTimer += dt;
+    if (lockTimer >= LOCK_DELAY || lockResets >= MAX_LOCK_RESETS) lockPiece();
+  } else {
+    lockTimer = 0;
+  }
+}
+
+/* ================= RENDERING ================= */
+function drawCell(c, px, py, color, alpha = 1) {
+  c.globalAlpha = alpha;
+  c.fillStyle = color;
+  c.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+  c.fillStyle = 'rgba(255,255,255,0.22)';
+  c.fillRect(px + 1, py + 1, CELL - 2, 3);
+  c.fillRect(px + 1, py + 1, 3, CELL - 2);
+  c.fillStyle = 'rgba(0,0,0,0.28)';
+  c.fillRect(px + 1, py + CELL - 4, CELL - 2, 3);
+  c.fillRect(px + CELL - 4, py + 1, 3, CELL - 2);
+  c.globalAlpha = 1;
+}
+
+function drawMini(c, type, cell, ox, oy, alpha = 1) {
+  const cells = SHAPES[type][0];
+  const xs = cells.map(p => p[0]), ys = cells.map(p => p[1]);
+  const minx = Math.min(...xs), maxx = Math.max(...xs);
+  const miny = Math.min(...ys), maxy = Math.max(...ys);
+  const w = (maxx - minx + 1) * cell, h = (maxy - miny + 1) * cell;
+  const px = ox + (4 * cell - w) / 2 - minx * cell;
+  const py = oy + (4 * cell - h) / 2 - miny * cell;
+  for (const [cx, cy] of cells) {
+    c.globalAlpha = alpha;
+    c.fillStyle = COLORS[type];
+    c.fillRect(px + cx * cell + 1, py + cy * cell + 1, cell - 2, cell - 2);
+    c.globalAlpha = 1;
+  }
+}
+
+function formatNum(n) { return n.toLocaleString('de-DE'); }
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Gitter
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for (let c = 1; c < COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(c * CELL + 0.5, 0); ctx.lineTo(c * CELL + 0.5, H); ctx.stroke();
+  }
+  for (let r = 1; r < VISIBLE_ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(0, r * CELL + 0.5); ctx.lineTo(W, r * CELL + 0.5); ctx.stroke();
+  }
+
+  // Board
+  for (let r = HIDDEN_ROWS; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const v = board[r][c];
+      if (!v) continue;
+      const py = (r - HIDDEN_ROWS) * CELL;
+      if (clearing && clearing.rows.includes(r)) {
+        const t = Math.max(0, clearTimer / 320);
+        ctx.fillStyle = `rgba(255,255,255,${0.35 + 0.65 * t})`;
+        ctx.fillRect(c * CELL, py, CELL, CELL);
+      } else {
+        drawCell(ctx, c * CELL, py, COLORS[v]);
+      }
+    }
+  }
+
+  // Ghost + aktives Piece
+  if (piece && !clearing) {
+    const cells = SHAPES[piece.type][piece.rotation];
+    const gy = ghostY();
+    for (const [cx, cy] of cells) {
+      const ry = gy + cy;
+      if (ry < HIDDEN_ROWS) continue;
+      const px = (piece.x + cx) * CELL, py = (ry - HIDDEN_ROWS) * CELL;
+      ctx.globalAlpha = 0.22;
+      ctx.strokeStyle = COLORS[piece.type];
+      ctx.lineWidth = 2;
+      ctx.strokeRect(px + 3, py + 3, CELL - 6, CELL - 6);
+      ctx.globalAlpha = 1;
+    }
+    for (const [cx, cy] of cells) {
+      const ry = piece.y + cy;
+      if (ry < HIDDEN_ROWS) continue;
+      drawCell(ctx, (piece.x + cx) * CELL, (ry - HIDDEN_ROWS) * CELL, COLORS[piece.type]);
+    }
+  }
+
+  // HOLD
+  holdCtx.clearRect(0, 0, 120, 120);
+  if (holdPiece) drawMini(holdCtx, holdPiece, 28, 0, 0, canHold ? 1 : 0.3);
+
+  // NEXT
+  nextCtx.clearRect(0, 0, 120, 600);
+  for (let i = 0; i < NEXT_COUNT; i++) {
+    if (queue[i]) drawMini(nextCtx, queue[i], 24, 0, i * 120, i === 0 ? 1 : 0.8 - i * 0.12);
+  }
+
+  // HUD
+  document.getElementById('score').textContent = formatNum(score);
+  document.getElementById('highscore').textContent = formatNum(Math.max(highscore, score));
+  document.getElementById('level').textContent = level;
+  document.getElementById('lines').textContent = lines;
+  document.getElementById('b2b').classList.toggle('hidden', !b2b);
+}
+
+function showPop(text) {
+  const el = document.getElementById('popup');
+  if (!text) return;
+  el.textContent = text;
+  el.classList.remove('show');
+  void el.offsetWidth; // Animation neu starten
+  el.classList.add('show');
+}
+
+/* ================= EINGABE ================= */
+function keyDownLeft() {
+  if (!piece || gameOver || paused || clearing) return;
+  if (tryMove(-1, 0, true)) { dasDir = -1; dasTimer = 0; arrTimer = 0; }
+}
+function keyDownRight() {
+  if (!piece || gameOver || paused || clearing) return;
+  if (tryMove(1, 0, true)) { dasDir = 1; dasTimer = 0; arrTimer = 0; }
+}
+function keyUpHorizontal() {
+  dasDir = keys.has('ArrowLeft') ? -1 : keys.has('ArrowRight') ? 1 : 0;
+  dasTimer = 0; arrTimer = 0;
+}
+
+window.addEventListener('keydown', (e) => {
+  const c = e.code;
+  if (['ArrowLeft','ArrowRight','ArrowDown','ArrowUp','Space','KeyZ','KeyX','KeyC',
+       'KeyP','KeyR','KeyM','Escape','ShiftLeft','ShiftRight','ControlLeft']
+       .includes(c)) e.preventDefault();
+
+  switch (c) {
+    case 'ArrowLeft':  keys.add(c); keyDownLeft(); break;
+    case 'ArrowRight': keys.add(c); keyDownRight(); break;
+    case 'ArrowDown':
+      keys.add(c);
+      softDropHeld = true;
+      if (!e.repeat && piece && !gameOver && !paused && !clearing) {
+        if (tryMove(0, 1, false)) score += 1;
+      }
+      break;
+    case 'ArrowUp': case 'KeyX':
+      if (!e.repeat) rotate(1);
+      break;
+    case 'KeyZ': case 'ControlLeft':
+      if (!e.repeat) rotate(-1);
+      break;
+    case 'Space':
+      if (!e.repeat) hardDrop();
+      break;
+    case 'KeyC': case 'ShiftLeft': case 'ShiftRight':
+      if (!e.repeat) doHold();
+      break;
+    case 'KeyP': case 'Escape':
+      if (!e.repeat) togglePause();
+      break;
+    case 'KeyR':
+      if (!e.repeat) newGame();
+      break;
+    case 'KeyM':
+      if (!e.repeat) muted = !muted;
+      break;
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  keys.delete(e.code);
+  if (e.code === 'ArrowDown') softDropHeld = false;
+  if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') keyUpHorizontal();
+});
+
+window.addEventListener('blur', () => {
+  keys.clear();
+  softDropHeld = false;
+  dasDir = 0;
+  if (!gameOver && !paused) togglePause();
+});
+
+document.getElementById('restartBtn').addEventListener('click', newGame);
+
+/* Touch-Controls */
+function bindTouch(id, fn) {
+  const el = document.getElementById(id);
+  el.addEventListener('pointerdown', (e) => { e.preventDefault(); fn(); });
+}
+bindTouch('tLeft', () => { keyDownLeft(); dasDir = -1; });
+bindTouch('tRight', () => { keyDownRight(); dasDir = 1; });
+bindTouch('tDown', () => {
+  softDropHeld = true;
+  if (piece && tryMove(0, 1, false)) score++;
+});
+document.getElementById('tDown').addEventListener('pointerup', () => softDropHeld = false);
+bindTouch('tRot', () => rotate(1));
+bindTouch('tDrop', hardDrop);
+bindTouch('tHold', doHold);
+bindTouch('tPause', togglePause);
+
+/* ================= START ================= */
+try { highscore = parseInt(localStorage.getItem(HIGHSCORE_KEY) || '0', 10) || 0; } catch (e) {}
+newGame();
+
+let lastT = performance.now();
+function frame(t) {
+  const dt = Math.min(t - lastT, 100);
+  lastT = t;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
